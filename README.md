@@ -45,26 +45,24 @@ MovieLens는 "유저가 영화에 평점을 남겼다"는 정적 스냅샷이지
 
 ## 3. 수집 → 처리 → 저장 흐름
 
-![파이프라인 아키텍처](docs/images/pipeline_architecture.png)
-
 ```
 [MovieLens CSV] ──(1회 로드)──▶ [PostgreSQL: 영화 메타 테이블 (+ TMDB 보강)]
-                                            │
-[이벤트 생성기 (Python)]                      │
-  MovieLens 타임스탬프를 시드로                 │
-  play/pause/seek/complete 이벤트 생성        │
-       │                                    │
-       ▼                                    │
-  [Kafka Topic: viewing-events]              │
-  (JSON, user_id 기준 파티셔닝)                │
-       │                                    │
-       ▼                                    │
-  [Spark Structured Streaming]               │
-  - mapGroupsWithState 기반 세션화             │
-    (30분 무활동 시 세션 종료, watermark로      │
-     late data 처리)                         │
-       │                                    │
-       ▼                                    ▼
+                                            
+[이벤트 생성기 (Python)]                    
+  MovieLens 타임스탬프를 시드로             
+  play/pause/seek/complete 이벤트 생성      
+       │                                    
+       ▼                                    
+  [Kafka Topic: viewing-events]             
+  (JSON, user_id 기준 파티셔닝)             
+       │                                    
+       ▼                                    
+  [Spark Structured Streaming]              
+  - mapGroupsWithState 기반 세션화          
+    (30분 무활동 시 세션 종료, watermark로  
+     late data 처리)                        
+       │                                    
+       ▼                                    
   [PostgreSQL: sessions 테이블] ◀── JOIN ── [영화 메타 테이블]
        │
        ▼
