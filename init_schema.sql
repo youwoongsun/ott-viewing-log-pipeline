@@ -1,14 +1,9 @@
--- OTT 시청 로그 파이프라인 - PostgreSQL 스키마
--- docker-compose가 최초 기동 시 자동 실행 (docker-entrypoint-initdb.d)
-
--- ─────────────────────────────────────────────
 -- 1. 참조 데이터 (MovieLens 원본 적재용)
--- ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS movies (
     movie_id    INTEGER PRIMARY KEY,
     title       TEXT NOT NULL,
-    genres      TEXT,                 -- 파이프(|) 구분 원본 그대로 저장
-    genre_list  TEXT[]                -- genres를 배열로 파싱해서 조회 편의성 확보
+    genres      TEXT,               
+    genre_list  TEXT[]               
 );
 
 CREATE TABLE IF NOT EXISTS movie_links (
@@ -47,10 +42,7 @@ CREATE TABLE IF NOT EXISTS ratings_raw (
 );
 CREATE INDEX IF NOT EXISTS idx_ratings_user ON ratings_raw(user_id);
 
--- ─────────────────────────────────────────────
 -- 2. Spark가 세션화한 결과가 최종적으로 쌓이는 테이블
---    (Spark Structured Streaming의 foreachBatch에서 이 테이블에 upsert)
--- ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS sessions (
     session_id      BIGINT PRIMARY KEY,
     user_id         INTEGER NOT NULL,
@@ -59,17 +51,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     end_ts          TIMESTAMPTZ NOT NULL,
     event_count     INTEGER NOT NULL,
     completed       BOOLEAN NOT NULL,
-    completion_rate NUMERIC(4,3),        -- position_sec(마지막) / runtime_sec 추정치
-    genre_list      TEXT[],              -- movies 테이블과 조인해서 채움
+    completion_rate NUMERIC(4,3),        
+    genre_list      TEXT[],             
     ingested_at     TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_movie ON sessions(movie_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_ts);
 
--- ─────────────────────────────────────────────
 -- 3. Airflow 배치가 매일 재계산하는 집계 테이블
--- ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS daily_genre_trend (
     trend_date      DATE NOT NULL,
     genre           TEXT NOT NULL,
@@ -86,12 +76,10 @@ CREATE TABLE IF NOT EXISTS daily_movie_ranking (
     PRIMARY KEY (trend_date, movie_id)
 );
 
--- ─────────────────────────────────────────────
--- 4. 장애 실험 결과를 기록해두는 테이블 (README의 "시나리오→문제→대응→결과" 표를 DB화)
--- ─────────────────────────────────────────────
+-- 4. 장애 실험 결과를 기록해두는 테이블 
 CREATE TABLE IF NOT EXISTS failure_experiments (
     experiment_id   SERIAL PRIMARY KEY,
-    scenario        TEXT NOT NULL,        -- 예: 'kafka_broker_restart'
+    scenario        TEXT NOT NULL,        
     started_at      TIMESTAMPTZ NOT NULL,
     ended_at        TIMESTAMPTZ,
     events_sent     BIGINT,
