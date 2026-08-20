@@ -13,6 +13,7 @@
 | `spark_session_pipeline.py` | Kafka 이벤트를 소비해서 세션화하고 PostgreSQL에 적재하는 Spark 잡 |
 | `requirements.txt` | 파이썬 의존성 |
 
+<img width="1742" height="766" alt="ott_pipeline_architecture_img" src="https://github.com/user-attachments/assets/9e0e3a2d-cd03-4c5e-9bd1-74ffb0e92417" />
 
 
 ## 데이터 적재 (Ingestion)
