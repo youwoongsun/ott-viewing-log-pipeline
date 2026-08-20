@@ -38,7 +38,7 @@ python load_reference_data.py --data-dir /path/to/movielens/csvs
 python ingest_v2_events.py --data-dir /path/to/viewing_events_v2
 ```
 
-**왜 COPY를 쓰는가**: 3,700만 건을 `INSERT`로 한 행씩 넣으면 몇 시간이 걸릴 수 있습니다. PostgreSQL의 `COPY`는 대량 적재 전용 경로라 같은 데이터를 몇 분 내로 적재합니다. gzip 파일도 압축을 풀면서 바로 스트리밍하므로 디스크에 압축 해제본을 따로 만들 필요가 없습니다.
+**COPY를 쓰는 이유**: 3,700만 건을 `INSERT`로 한 행씩 넣으면 몇 시간이 걸릴 수 있다. PostgreSQL의 `COPY`는 대량 적재 전용 경로라 같은 데이터를 몇 분 내로 적재한다. gzip 파일도 압축을 풀면서 바로 스트리밍하므로 디스크에 압축 해제본을 따로 만들 필요가 없다.
 
 **적재되는 3개 테이블**:
 - `raw_viewing_events` — 원본 이벤트 스트림 (3,700만 건). Kafka로 흘려보내기 전 소스이자, Spark가 계산한 세션 결과를 검증할 정답지 역할
@@ -64,7 +64,7 @@ python kafka_producer.py --csv /path/to/viewing_events_v2/viewing_events_part000
 python kafka_producer.py --csv /path/to/viewing_events_v2/viewing_events_part0001.csv.gz --rate 0
 ```
 
-`kafka_producer.py`는 CSV 헤더를 그대로 읽어 JSON으로 변환하므로, 구버전 6컬럼 스키마와 v2 16컬럼 스키마 둘 다 그대로 동작합니다.
+`kafka_producer.py`는 CSV 헤더를 그대로 읽어 JSON으로 변환하므로, 구버전 6컬럼 스키마와 v2 16컬럼 스키마 둘 다 그대로 동작한다.
 
 ## 장애 실험 시 이렇게 활용
 
@@ -74,6 +74,6 @@ python kafka_producer.py --csv /path/to/viewing_events_v2/viewing_events_part000
 
 ## 참고
 
-- `raw_viewing_events` 테이블 자체가 세션의 "정답"을 담고 있으므로(session_start/session_end가 명시적), Spark가 만든 `sessions` 테이블 결과와 대조하면 세션화 로직 정확도를 정량적으로 검증할 수 있습니다.
-- `spark_session_pipeline.py`의 세션화 로직은 스케치 수준이며, 실제 구현 시 `mapGroupsWithState`로 교체해 사용자별 상태를 더 정교하게 관리할 계획입니다 (watermark 값도 실험 후 확정).
+- `raw_viewing_events` 테이블 자체가 세션의 "정답"을 담고 있으므로(session_start/session_end가 명시적), Spark가 만든 `sessions` 테이블 결과와 대조하면 세션화 로직 정확도를 정량적으로 검증할 수 있다.
+- `spark_session_pipeline.py`의 세션화 로직은 스케치 수준이며, 실제 구현 시 `mapGroupsWithState`로 교체해 사용자별 상태를 더 정교하게 관리할 계획이다 (watermark 값도 실험 후 확정)
 
