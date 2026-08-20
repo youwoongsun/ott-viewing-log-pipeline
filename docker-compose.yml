@@ -1,0 +1,53 @@
+version: "3.8"
+
+# OTT 시청 로그 파이프라인 - 로컬 개발용 Docker Compose
+# 실행: docker compose up -d
+# 종료: docker compose down -v   (볼륨까지 삭제하고 싶을 때)
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: ott-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft 모드 (Zookeeper 없이 단일 브로커로 실행 - 로컬 개발엔 이걸로 충분)
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "ott-pipeline-cluster-01"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  postgres:
+    image: postgres:16
+    container_name: ott-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ott
+      POSTGRES_PASSWORD: ott_pw
+      POSTGRES_DB: ott_pipeline
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ott -d ott_pipeline"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  kafka_data:
+  postgres_data:
