@@ -1,17 +1,11 @@
 """
 Spark Structured Streaming - 세션화 후 PostgreSQL 적재
-==========================================================
 Kafka(viewing-events) -> mapGroupsWithState 세션화 -> movies 조인 -> PostgreSQL(sessions) 적재
 
 핵심 설계:
 - 30분 무활동 시 세션 종료로 판정 (SESSION_TIMEOUT_SEC)
 - watermark로 늦게 도착한 이벤트(late data) 처리 (WATERMARK_DELAY) — 값은 실험으로 확정 예정
 - foreachBatch에서 PostgreSQL에 upsert (체크포인트로 장애 시 재시작해도 중복/유실 없이 이어서 처리)
-
-실행 예:
-  spark-submit \
-    --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.7.3 \
-    spark_session_pipeline.py
 """
 
 import os
@@ -32,9 +26,9 @@ PG_PROPS = {
     "driver": "org.postgresql.Driver",
 }
 
-# ── 아직 실험으로 확정 전인 값들 (README 참고) ──────────────────
-SESSION_TIMEOUT_SEC = 30 * 60     # 30분 무활동 -> 세션 종료
-WATERMARK_DELAY = "10 minutes"    # 초기값. 유실률/지연 트레이드오프 실험 후 조정 예정
+# ── 아직 실험으로 확정 전인 값들
+SESSION_TIMEOUT_SEC = 30 * 60    
+WATERMARK_DELAY = "10 minutes"  
 
 EVENT_SCHEMA = StructType([
     StructField("user_id", IntegerType()),
@@ -105,7 +99,7 @@ def write_to_postgres(batch_df, batch_id: int):
     (
         batch_df.write.format("jdbc")
         .option("url", PG_URL)
-        .option("dbtable", "sessions_staging")   # 실제로는 MERGE/UPSERT용 스테이징 테이블에 적재 후 SQL로 병합
+        .option("dbtable", "sessions_staging")
         .options(**PG_PROPS)
         .mode("append")
         .save()
