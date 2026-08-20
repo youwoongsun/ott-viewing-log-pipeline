@@ -1,12 +1,7 @@
 """
 참조 데이터 적재 스크립트 (load_reference_data.py)
-======================================================
-movies.csv / links.csv / tags.csv / ratings.csv를 PostgreSQL에 적재한다.
-Kafka/Spark 파이프라인이 세션화 결과를 만들 때 조인할 "영화 자체 정보"를
-미리 채워두는 1회성 배치 작업이다.
-
-실행 전: docker compose up -d 로 Postgres가 떠 있어야 함
-실행:    python load_reference_data.py --data-dir /path/to/movielens/csvs
+movies.csv / links.csv / tags.csv / ratings.csv를 PostgreSQL에 적재
+Kafka/Spark 파이프라인이 세션화 결과를 만들 때 조인할 영화 자체 정보를 미리 채워두는 1회성 배치 작업
 """
 
 import argparse
@@ -27,7 +22,6 @@ def load_movies(engine, data_dir: Path):
     )
     with engine.begin() as conn:
         conn.execute(text("TRUNCATE movies CASCADE"))
-        # genre_list(배열)는 to_sql이 못 다루므로 executemany로 직접 삽입
         rows = df[["movie_id", "title", "genres", "genre_list"]].to_dict("records")
         conn.execute(
             text(
