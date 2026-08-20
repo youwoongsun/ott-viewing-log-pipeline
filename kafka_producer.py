@@ -49,12 +49,6 @@ def build_producer(bootstrap_servers: str) -> KafkaProducer:
 
 
 def stream_csv(csv_path: Path, producer: KafkaProducer, rate_per_sec: int, report_every: int):
-    """
-    CSV 헤더를 그대로 읽어서 JSON으로 변환한다 (컬럼 개수/이름에 의존하지 않음).
-    구버전(6컬럼: user_id,movie_id,session_id,event_type,event_ts,position_sec)과
-    v2(16컬럼: event_id,...,device,tag_value,value) 둘 다 그대로 동작한다.
-    빈 문자열은 None으로, 숫자로 보이는 값은 int/float로 자동 변환한다.
-    """
     sent = 0
     failed = 0
     start = time.time()
