@@ -9,7 +9,11 @@ OTT(넷플릭스, 왓챠 등) 서비스의 시청 이벤트를 실시간으로 �
 ---
 ### 상세 문서 및 아키텍처
 데이터 파이프라인의 상세 구조와 아키텍처 다이어그램은 아래 문서에서 확인하실 수 있습니다.
-**[파이프라인 상세 안내 (PIPELINE_README.md)](./pipeline/PIPELINE_README.md)**
+**[파이프라인 상세 안내 (PIPELINE_README.md)](./PIPELINE_README.md)**
+
+### 4주차 제출물 (Kafka 이벤트 스트리밍 & Spark 배치 전처리)
+- **[데이터·메시지 명세 (DATA_MESSAGE_SPEC.md)](./DATA_MESSAGE_SPEC.md)** — 필드명/타입/의미, Kafka JSON 예시, Topic 이름
+- **[Kafka/Spark 실행 결과 및 실제 구현 vs 계획 (kafka_spark.md)](./kafka_spark.md)** — 실행 명령, 처리 전후 건수, 최종 저장 위치/형식
 
 ## 2. 사용할 데이터셋과 출처
 
