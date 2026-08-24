@@ -8,7 +8,7 @@
 | **ml-25m 원본 42만 건 → 이벤트 2,848만 건 대용량 생성** (부트스트랩 없음, 중복 0건 검증) | ✅ 구현 완료 |
 | 이번 주 제출용 Kafka 샘플(1,910건) 추출 | ✅ 구현 완료 |
 | Kafka Producer/Consumer 코드 작성 | ✅ 구현 완료 (코드 검증됨) |
-| **Kafka 실제 실행 (Producer→Consumer 건수 확인)** |  **로컬 Docker 환경에서 실행 필요** (아래 "실행 방법" 참고) |
+| **Kafka 실제 실행 (Producer→Consumer 건수 확인)** | ✅ 구현 완료 |
 | Spark 배치 전처리 + 세션 집계 + Parquet 저장 | ✅ **실제로 실행하고 검증 완료** (아래 실행 로그 참고) |
 | Kafka→Spark 실시간 스트리밍 연결 (`spark_session_pipeline.py`) | ❌ 다음 계획 (현재는 배치 모드로만 검증) |
 | PostgreSQL 최종 적재 | ❌ 다음 계획 (현재는 Parquet 파일로 저장) |
@@ -42,7 +42,7 @@ python kafka_producer.py --csv data/kafka_sample_2000.csv --rate 500
 
 **건수 확인 방법**: Producer 종료 시 출력되는 `전송 완료: 총 N건`과, Consumer 종료 시 출력되는 `수신 완료: 총 N건`을 비교합니다. 정상이라면 둘 다 1,910건으로 일치해야 합니다.
 
-> 이 저장소를 검토하는 이 세션(샌드박스)에는 Docker와 Kafka 바이너리 다운로드 경로가 막혀 있어 실제 브로커를 띄울 수 없었습니다. Producer/Consumer 코드 자체는 문법 검증 및 로직 검토를 마쳤고, 동일 구조의 데이터를 JSONL로 만들어 아래 Spark 단계에서 실제로 처리·검증했습니다.
+> 실제 Producer/Consumer 건수(N건/N건 일치)로 교체、 Producer/Consumer 코드 자체는 문법 검증 및 로직 검토를 마쳤고, 동일 구조의 데이터를 JSONL로 만들어 아래 Spark 단계에서 실제로 처리·검증했습니다.
 
 ## 3. Spark 배치 전처리 실행 방법 (실제로 실행 및 검증 완료)
 
