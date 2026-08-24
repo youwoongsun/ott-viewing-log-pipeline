@@ -18,7 +18,7 @@ services:
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      CLUSTER_ID: "ott-pipeline-cluster-01"
+      CLUSTER_ID: "eHYIrpKZQfW0n_8-uhv4BA"
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
