@@ -1,6 +1,8 @@
 """
 Kafka Producer - 이벤트 생성기 결과를 viewing-events 토픽으로 스트리밍
-generate_events.py(또는 대용량 버전)가 만든 CSV를 읽어서, 실제 서비스처럼 한 건씩 순차적으로 들어오는 형태로 Kafka에 보냄
+=========================================================================
+generate_events.py(또는 대용량 버전)가 만든 CSV를 읽어서, 실제 서비스처럼
+"한 건씩 순차적으로 들어오는" 형태로 Kafka에 흘려보낸다.
 
 파티셔닝: user_id 기준 -> 같은 유저의 이벤트 순서를 보장 (세션화 정합성에 필수)
 
@@ -40,15 +42,22 @@ def build_producer(bootstrap_servers: str) -> KafkaProducer:
         bootstrap_servers=bootstrap_servers,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         key_serializer=lambda k: str(k).encode("utf-8"),
+        # 장애 실험 관련 설정: 브로커가 잠깐 죽었다 살아나도 재시도해서 유실을 줄인다
         retries=10,
         retry_backoff_ms=500,
-        acks="all",                
-        linger_ms=20,
+        acks="all",                 # 모든 in-sync replica가 받았다는 응답까지 기다림 (내구성 우선)
+        linger_ms=20,                # 짧게 모아서 배치 전송 (처리량 개선)
         max_in_flight_requests_per_connection=5,
     )
 
 
 def stream_csv(csv_path: Path, producer: KafkaProducer, rate_per_sec: int, report_every: int):
+    """
+    CSV 헤더를 그대로 읽어서 JSON으로 변환한다 (컬럼 개수/이름에 의존하지 않음).
+    구버전(6컬럼: user_id,movie_id,session_id,event_type,event_ts,position_sec)과
+    v2(16컬럼: event_id,...,device,tag_value,value) 둘 다 그대로 동작한다.
+    빈 문자열은 None으로, 숫자로 보이는 값은 int/float로 자동 변환한다.
+    """
     sent = 0
     failed = 0
     start = time.time()
@@ -73,6 +82,7 @@ def stream_csv(csv_path: Path, producer: KafkaProducer, rate_per_sec: int, repor
 
     with open_csv(csv_path) as f:
         reader = csv.DictReader(f)
+        # 파티션 키로 쓸 유저 컬럼 자동 탐지 (구버전/v2 모두 user_id 사용)
         key_field = "user_id" if "user_id" in reader.fieldnames else reader.fieldnames[0]
 
         for row in reader:
