@@ -1,33 +1,14 @@
 """
 daily_batch_dag.py — 일 배치로 장르별 트렌드/영화 랭킹 재계산
 ==================================================================
-README 3-4절 설계를 그대로 구현:
   - 일 배치로 전일 랭킹/리텐션 지표 재계산
   - retry/backoff: 지수 백오프, 최대 재시도 횟수 설정
   - 데이터 품질 체크: 집계 건수 이상 감지, null 체크 등
-
-파이프라인에서 이 DAG의 위치:
-  Kafka -> Spark(세션화) -> PostgreSQL(sessions 테이블)  ← 여기까지는 실시간
-  PostgreSQL(sessions) -> [이 Airflow DAG, 매일 1회 배치] -> daily_genre_trend / daily_movie_ranking
-
 DAG 구조 (4단계, 순서대로 의존):
   1. check_source_data   : sessions 테이블에 대상 날짜 데이터가 있는지, 필수 필드 null이 없는지 확인
   2. compute_genre_trend : 장르별 세션 수 / 완주율 집계 -> daily_genre_trend
   3. compute_movie_ranking : 영화별 세션 수로 랭킹 산정 -> daily_movie_ranking
   4. validate_results    : 방금 쓴 결과가 정상 범위인지 사후 검증 (건수 0이면 실패 처리)
-
-실행 방법 (Airflow 설치 후):
-  export AIRFLOW_HOME=~/airflow
-  airflow db init
-  cp daily_batch_dag.py $AIRFLOW_HOME/dags/
-  airflow tasks test daily_batch_dag check_source_data 2024-01-01
-  airflow tasks test daily_batch_dag compute_genre_trend 2024-01-01
-  airflow tasks test daily_batch_dag compute_movie_ranking 2024-01-01
-  airflow tasks test daily_batch_dag validate_results 2024-01-01
-
-  # 또는 스케줄러/웹서버까지 띄워서 매일 자동 실행:
-  airflow scheduler &
-  airflow webserver &
 """
 
 from datetime import datetime, timedelta
