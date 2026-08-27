@@ -123,7 +123,7 @@ with DAG(
     t2_ingest = BashOperator(
         task_id="ingest_events",
         bash_command=(
-            f"python3 {PROJECT_DIR}/backfill_ingest.py "
+            f"python3 {PROJECT_DIR}/pipeline/backfill_ingest.py "
             "--input {{ ti.xcom_pull(task_ids='extract_window', key='window_path') }} "
             "--backfill-tag {{ ti.xcom_pull(task_ids='extract_window', key='tag') }} "
             f"--db-url {PG_DSN}"
@@ -134,7 +134,7 @@ with DAG(
     t3_spark = BashOperator(
         task_id="spark_process",
         bash_command=(
-            f"python3 {PROJECT_DIR}/spark_batch_preprocess.py "
+            f"python3 {PROJECT_DIR}/pipeline/spark_batch_preprocess.py "
             "--input {{ ti.xcom_pull(task_ids='extract_window', key='window_path') }} "
             "--input-format csv "
             f"--out-dir {WORK_DIR}/"
