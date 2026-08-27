@@ -1,7 +1,6 @@
 """
 spark_batch_preprocess.py — Kafka로 보낸 것과 같은 구조의 데이터를 Spark 배치로 전처리/저장
 =====================================================================================
-과제 요구사항:
   - Kafka에 보낸 것과 같은 구조의 데이터를 Spark로 처리 (배치 처리 OK)
   - 프로젝트에 필요한 전처리 수행 후 처리 전후 건수 확인
   - 결과를 파일/DB에 저장, 최종 컬럼/저장 형식 정리
@@ -14,9 +13,6 @@ spark_batch_preprocess.py — Kafka로 보낸 것과 같은 구조의 데이터�
   2. event_timestamp를 실제 timestamp 타입으로 캐스팅 (문자열 -> TimestampType)
   3. position_sec이 음수이거나 duration_sec을 초과하는 비정상 값 제거
   4. 세션(session_id) 단위로 집계: 시작/종료 시각, 이벤트 개수, 완주 여부, 최대 도달 위치
-
-실행 예 (로컬 모드, 클러스터 불필요):
-  python spark_batch_preprocess.py --input consumed_events.jsonl --out-dir ./output
 """
 
 import argparse
@@ -51,9 +47,14 @@ SCHEMA = StructType([
 
 def main():
     ap = argparse.ArgumentParser(description="Kafka 이벤트를 Spark 배치로 전처리/집계/저장")
-    ap.add_argument("--input", required=True, help="JSONL 파일 경로 (kafka_consumer.py 산출물과 동일 스키마)")
+    ap.add_argument("--input", required=True, help="입력 파일 경로 (JSONL 또는 CSV, --input-format으로 지정)")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--format", default="parquet", choices=["parquet", "csv"])
+    ap.add_argument("--format", default="parquet", choices=["parquet", "csv"], help="출력 파일 형식")
+    ap.add_argument("--input-format", default="json", choices=["json", "csv"], help="입력 파일 형식")
+    ap.add_argument("--driver-memory", default="4g",
+                     help="Spark local 모드 드라이버 메모리 (대용량 입력일수록 늘려야 함, 기본 4g)")
+    ap.add_argument("--shuffle-partitions", type=int, default=8,
+                     help="groupBy 등 셔플 단계의 파티션 수. 이벤트 수가 많을수록 값을 늘려야 태스크당 메모리 부담이 줄어듦")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -62,7 +63,8 @@ def main():
     spark = (
         SparkSession.builder.appName("ott-week4-batch-preprocess")
         .master("local[*]")
-        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.driver.memory", args.driver_memory)
+        .config("spark.sql.shuffle.partitions", str(args.shuffle_partitions))
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
@@ -70,7 +72,11 @@ def main():
     print("=" * 60)
     print("1. 원본 이벤트 로드")
     print("=" * 60)
-    raw = spark.read.schema(SCHEMA).json(args.input)
+    if args.input_format == "csv":
+        # extract_window()가 pandas df.to_csv()로 저장한 파일 (헤더 포함)
+        raw = spark.read.schema(SCHEMA).option("header", True).csv(args.input)
+    else:
+        raw = spark.read.schema(SCHEMA).json(args.input)
     raw_count = raw.count()
     print(f"  처리 전 건수: {raw_count:,}행")
 
