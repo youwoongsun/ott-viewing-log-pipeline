@@ -10,6 +10,7 @@ Airflow DAG(backfill_ingest_process_dag.py)의 ingest_events 태스크가 이 �
 
 import argparse
 import csv
+import hashlib
 import sys
 import time
 from datetime import datetime, timezone
@@ -67,7 +68,13 @@ def main():
     # 멱등성: 같은 backfill_tag로 이미 적재된 행이 있으면 먼저 지운다.
     # (raw_viewing_events에 backfill_tag 컬럼이 없으므로, event_id 범위로 태그를 구분한다.
     #  이 스크립트가 만드는 event_id는 tag의 해시를 기반으로 하므로 재실행해도 같은 범위를 지운다)
-    tag_offset = abs(hash(args.backfill_tag)) % 1_000_000 * 1_000_000_000
+    #
+    # 주의: 파이썬 내장 hash()는 문자열에 대해 프로세스마다 랜덤 시드(PYTHONHASHSEED)를 쓰기 때문에
+    # 같은 backfill_tag라도 실행할 때마다 다른 정수가 나올 수 있다. 그러면 재실행 시 이전 행을
+    # 못 지우고 새 event_id 범위에 다시 쌓여서 "멱등성"이 깨진다. hashlib(sha256)은 입력이 같으면
+    # 프로세스/재시작 여부와 무관하게 항상 같은 값을 반환하므로 이걸로 태그 오프셋을 계산한다.
+    tag_hash = hashlib.sha256(args.backfill_tag.encode("utf-8")).hexdigest()
+    tag_offset = (int(tag_hash, 16) % 1_000_000) * 1_000_000_000
     with conn.cursor() as cur:
         cur.execute(
             "DELETE FROM raw_viewing_events WHERE event_id >= %s AND event_id < %s",
