@@ -1,7 +1,6 @@
 """
 backfill_ingest_process_dag.py — 날짜 구간을 입력값으로 받아 수집→처리를 재실행하는 DAG
 ================================================================================
-과제 요구사항 대응:
   1. 지금까지 만든 수집(backfill_ingest.py) · 처리(spark_batch_preprocess.py) 코드를
      Airflow DAG로 실행한다. 둘 다 새로 만든 로직이 아니라, 기존 스크립트를 그대로
      BashOperator로 호출한다.
@@ -11,13 +10,6 @@ backfill_ingest_process_dag.py — 날짜 구간을 입력값으로 받아 수�
        - source_path            (선택, 다른 입력 파일로 바꿔 실행 가능)
   3. 값을 바꿔 여러 번 실행해도 안전하도록(중복 방지) backfill_ingest.py가
      backfill_tag 기준으로 기존 행을 지우고 다시 넣는 멱등성을 보장한다.
-
-실행 예 (Airflow UI에서 "Trigger DAG w/ config"로 아래 JSON을 넣거나, CLI로):
-  airflow dags trigger backfill_ingest_process_dag \
-    --conf '{"start_date": "2018-01-01", "end_date": "2018-12-31"}'
-
-  airflow dags trigger backfill_ingest_process_dag \
-    --conf '{"start_date": "2016-01-01", "end_date": "2016-12-31", "genre": "Comedy"}'
 """
 
 import os
