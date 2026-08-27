@@ -1,18 +1,28 @@
 """
 ingest_v2_events.py — v2 이벤트 데이터셋을 PostgreSQL에 대량 적재 (방어적 버전)
-CSV를 그대로 COPY에 흘려보냈는데, 생성기 버그로 event_timestamp 컬럼에 유닉스 epoch 숫자("964979315.268555")와 ISO8601 문자열("2017-05-03T22:...")
-포맷이 섞여 있어서 COPY가 통째로 실패/롤백되는 문제가 있었다. 생성기 소스(emit 함수)의 근본 원인은 고쳤지만, 
-이미 다른 방식으로 만들어진 데이터가 들어올 가능성에 대비해 적재 스크립트 자체도 두 가지 방어 장치를 추가
+====================================================================================
+[이력] 최초 버전은 CSV를 그대로 COPY에 흘려보냈는데, 생성기 버그로 event_timestamp
+컬럼에 유닉스 epoch 숫자("964979315.268555")와 ISO8601 문자열("2017-05-03T22:...")
+포맷이 섞여 있어서 COPY가 통째로 실패/롤백되는 문제가 있었다. 생성기 소스(emit 함수)의
+근본 원인은 고쳤지만, 이미 다른 방식으로 만들어진 데이터가 들어올 가능성에 대비해
+적재 스크립트 자체도 두 가지 방어 장치를 추가했다:
 
   1. event_timestamp 정규화: 숫자로 보이면 ISO로 변환, 이미 날짜 형식이면 그대로 통과
   2. 청크 COPY: 파일 전체를 하나의 트랜잭션으로 묶지 않고 N행(기본 100,000)마다
      끊어서 커밋 → 특정 구간에 문제가 있어도 그 청크만 실패하고 나머지는 살아남는다
 
-COPY(그것도 청크 단위)를 쓰는 이유
-  psycopg2로 한 행씩 INSERT하면 3,700만 건 기준 몇 시간이 걸릴 수 있음
-  COPY는 대량 적재 전용 경로라 같은 데이터를 몇 분 내로 적재함 
-  COPY는 기본적으로 파일 하나 = 트랜잭션 하나라서, 행 하나만 형식이 틀려도 전체가 롤백됨
-  청크 단위로 잘라 커밋하면 "빠른 속도와 일부 실패해도 전체는 안전함을 동시에 얻음
+왜 COPY(그것도 청크 단위)를 쓰는가:
+  psycopg2로 한 행씩 INSERT하면 3,700만 건 기준 몇 시간이 걸릴 수 있다. COPY는
+  대량 적재 전용 경로라 같은 데이터를 몇 분 내로 적재한다. 다만 COPY는 기본적으로
+  파일 하나 = 트랜잭션 하나라서, 행 하나만 형식이 틀려도 전체가 롤백된다. 그래서
+  청크 단위로 잘라 커밋하면 "빠름"과 "일부 실패해도 전체는 안전함"을 동시에 얻는다.
+
+실행 전: docker compose up -d 로 Postgres가 떠 있어야 하고,
+         sql/init_schema.sql + sql/schema_v2_events.sql이 적용돼 있어야 함
+
+사용 예:
+  python ingest_v2_events.py --data-dir /path/to/viewing_events_v2
+  python ingest_v2_events.py --data-dir ... --chunk-rows 50000   # 청크 크기 조정
 """
 
 import argparse
@@ -24,6 +34,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
 import psycopg2
 import psycopg2.extras
 
@@ -134,6 +145,77 @@ def copy_csv_simple(conn, csv_path: Path, table: str, columns: list, truncate_fi
     print(f"  {csv_path.name} -> {table}: {elapsed:.1f}초 | 테이블 누적 {total:,}행")
 
 
+def load_heatmap_merged(conn, data_dir: Path, table: str = "movie_segment_heatmap"):
+    """
+    generate_events_v2.py를 여러 청크(--chunk-index)로 나눠 돌리면
+    movie_segment_heatmap_part0000.csv, part0001.csv ... 여러 개가 생긴다.
+    같은 영화의 같은 구간(segment)이 서로 다른 청크(=서로 다른 유저 집합)에서
+    각각 부분 카운트로 잡혀 있을 수 있어서, 파일을 그냥 이어붙이면
+    (movie_id, segment_index) PRIMARY KEY가 중복되어 적재가 실패한다.
+    그래서 청크 전체를 합쳐 watch_count를 합산하고, peak 구간을 다시 계산한 뒤
+    최종 결과 1벌만 COPY한다.
+    """
+    part_files = sorted(data_dir.glob("movie_segment_heatmap_part*.csv*"))
+    if not part_files:
+        # 청크 없이 옛날 방식으로 만든 단일 파일도 지원
+        single = next(data_dir.glob("movie_segment_heatmap.csv*"), None)
+        part_files = [single] if single else []
+    if not part_files:
+        sys.exit(f"movie_segment_heatmap_part*.csv(.gz) 파일을 찾을 수 없습니다: {data_dir}")
+
+    t0 = time.time()
+    merged = pd.concat([pd.read_csv(fp) for fp in part_files], ignore_index=True)
+    agg = (
+        merged.groupby(["movie_id", "movie_title", "genre", "segment_index"], as_index=False)["watch_count"]
+        .sum()
+    )
+    peak_idx = agg.groupby("movie_id")["watch_count"].idxmax()
+    agg["is_peak_segment"] = False
+    agg.loc[peak_idx, "is_peak_segment"] = True
+    agg = agg[HEATMAP_COLUMNS]
+
+    buf = io.StringIO()
+    agg.to_csv(buf, index=False, header=False)
+    buf.seek(0)
+    with conn.cursor() as cur:
+        cur.execute(f"TRUNCATE {table}")
+        cur.copy_expert(f"COPY {table} ({', '.join(HEATMAP_COLUMNS)}) FROM STDIN WITH (FORMAT csv, NULL '')", buf)
+    conn.commit()
+    print(f"  청크 {len(part_files)}개 병합 -> {table}: {len(agg):,}행 ({time.time()-t0:.1f}초)")
+
+
+def load_engagement_merged(conn, data_dir: Path, table: str = "user_movie_engagement_summary"):
+    """
+    user_movie_engagement_summary도 청크별로 part 파일이 나뉜다. ratings.csv에서
+    (user_id, movie_id) 조합은 원본 자체가 유일하므로 청크 간 중복은 이론상 없지만,
+    혹시 모를 재실행/겹침에 대비해 방어적으로 중복 제거 후 적재한다.
+    """
+    part_files = sorted(data_dir.glob("user_movie_engagement_summary_part*.csv*"))
+    if not part_files:
+        single = next(data_dir.glob("user_movie_engagement_summary.csv*"), None)
+        part_files = [single] if single else []
+    if not part_files:
+        sys.exit(f"user_movie_engagement_summary_part*.csv(.gz) 파일을 찾을 수 없습니다: {data_dir}")
+
+    t0 = time.time()
+    merged = pd.concat([pd.read_csv(fp) for fp in part_files], ignore_index=True)
+    before = len(merged)
+    merged = merged.drop_duplicates(subset=["user_id", "movie_id"], keep="last")
+    dup = before - len(merged)
+    merged = merged[ENGAGEMENT_COLUMNS]
+
+    buf = io.StringIO()
+    merged.to_csv(buf, index=False, header=False)
+    buf.seek(0)
+    with conn.cursor() as cur:
+        cur.execute(f"TRUNCATE {table}")
+        cur.copy_expert(f"COPY {table} ({', '.join(ENGAGEMENT_COLUMNS)}) FROM STDIN WITH (FORMAT csv, NULL '')", buf)
+    conn.commit()
+    if dup:
+        print(f"  경고: (user_id, movie_id) 중복 {dup:,}행 제거됨 (마지막 값 유지)")
+    print(f"  청크 {len(part_files)}개 병합 -> {table}: {len(merged):,}행 ({time.time()-t0:.1f}초)")
+
+
 def main():
     ap = argparse.ArgumentParser(description="v2 이벤트 데이터셋을 PostgreSQL에 청크 COPY로 대량 적재")
     ap.add_argument("--data-dir", required=True)
@@ -173,20 +255,14 @@ def main():
     print("\n" + "=" * 60)
     print("2. movie_segment_heatmap 적재")
     print("=" * 60)
-    heatmap_fp = next(data_dir.glob("movie_segment_heatmap.csv*"), None)
-    if heatmap_fp is None:
-        sys.exit("movie_segment_heatmap.csv(.gz)를 찾을 수 없습니다")
     with psycopg2.connect(args.db_url) as conn:
-        copy_csv_simple(conn, heatmap_fp, "movie_segment_heatmap", HEATMAP_COLUMNS, truncate_first=True)
+        load_heatmap_merged(conn, data_dir)
 
     print("\n" + "=" * 60)
     print("3. user_movie_engagement_summary 적재")
     print("=" * 60)
-    eng_fp = next(data_dir.glob("user_movie_engagement_summary.csv*"), None)
-    if eng_fp is None:
-        sys.exit("user_movie_engagement_summary.csv(.gz)를 찾을 수 없습니다")
     with psycopg2.connect(args.db_url) as conn:
-        copy_csv_simple(conn, eng_fp, "user_movie_engagement_summary", ENGAGEMENT_COLUMNS, truncate_first=True)
+        load_engagement_merged(conn, data_dir)
 
     print("\n완료.")
 
