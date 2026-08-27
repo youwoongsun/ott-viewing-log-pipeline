@@ -149,7 +149,67 @@ data/
 `ml-25m`은 용량 문제로 레포에 포함하지 않았습니다. 아래 링크에서 직접 다운받아 `data/raw/ml-25m/` 경로에 압축한 뒤 사용할 예정이다.
 https://grouplens.org/datasets/movielens/25m/
 
+## 6. Airflow DAG 파라미터화
 
+지금까지 만든 수집(`backfill_ingest.py`)·처리(`spark_batch_preprocess.py`)
+코드를 Airflow DAG(`dags/backfill_ingest_process_dag.py`)로 연결하고,
+코드를 고치지 않고도 값을 바꿔 재실행할 수 있도록 파라미터화했다.
+
+### 파라미터 설계
+
+주식 데이터의 `ticker`에 해당하는 축으로, 이 프로젝트에서는 아래 4개를
+Airflow `Param`으로 받는다.
+
+| 파라미터 | 의미 |
+|---|---|
+| `start_date` / `end_date` | 수집·처리할 기간 |
+| `genre` | 선택, 특정 장르만 필터링 (비우면 전체) |
+| `source_path` | 선택, 다른 입력 CSV로 교체 (비우면 기본 샘플 사용) |
+
+### DAG 구조 (4단계)
+
+1. `extract_window` — source_path 원본을 청크 단위로 스캔하며 날짜/장르
+   조건에 맞는 행만 필터링 (대용량 원본에서도 메모리 부담을 낮추기 위해
+   전체를 한 번에 메모리에 올리지 않음)
+2. `ingest_events` — `backfill_ingest.py`로 필터링된 구간을 PostgreSQL에
+   적재. 같은 조건(`backfill_tag`)으로 재실행해도 중복이 쌓이지 않도록
+   해시 기반 멱등성 처리
+3. `spark_process` — `spark_batch_preprocess.py`(Spark)로 세션 단위 집계
+4. `quality_check` — 처리 건수가 0건이면 실패 처리
+
+### 재실행 검증
+
+같은 코드로 조건만 바꿔 두 차례 실행했다.
+
+| 조건 | 결과 |
+|---|---|
+| 전체 기간, 장르 전체 | ![](airflow_screenshots/extract_window_all-comedy.png) ![](airflow_screenshots/spark_process_all-comedy.png) ![](airflow_screenshots/total_success_all-comedy.png) |
+| `2000-01-01 ~ 2023-12-31`, `genre=Comedy` | ![](airflow_screenshots/extract_window_2000-2023_comedy.png) ![](airflow_screenshots/spark_process_2000-2023_comedy.png) |
+| `2010-01-01 ~ 2023-12-31`, `genre=Action` | ![](airflow_screenshots/extract_window_2010-2023_action.png) ![](airflow_screenshots/spark_process_2010-2023_action.png) |
+
+세 실행 모두 코드 수정 없이 Trigger 시 파라미터 값만 바꿔서 실행했고,
+4개 태스크(`extract_window → ingest_events → spark_process →
+quality_check`) 전부 성공했다.
+
+### 대용량(ml-25m) 처리 안정화
+
+`source_path`에 MovieLens ml-25m(평점 2,500만 건) 기반으로 생성한
+약 2,000만 건 규모 이벤트 데이터를 지정해 실제로 재실행하면서, 다음
+문제를 발견하고 고쳤다.
+
+- `load_reference_data.py`: 평점 데이터를 건별 INSERT하던 방식은
+  2,500만 건 규모에서 사실상 멈춰서, PostgreSQL COPY 기반 대량 적재로
+  변경 (2,500만 행 약 250초에 적재)
+- `ingest_v2_events.py`: 여러 청크로 나눠 생성 시 같은 영화의 같은 구간이
+  청크마다 중복 집계되는 문제가 있어, 병합·재집계 로직 추가
+- `extract_window`: 원본 전체를 메모리에 올리던 방식을 청크 단위 스캔으로
+  변경
+
+### 진행 중 (이번 제출 범위 밖)
+
+장애 주입 실험(Kafka 브로커 재시작, Spark 강제 종료 후 체크포인트 복구,
+Consumer lag 관찰)과 실시간 스트리밍(`spark_session_pipeline.py`)은
+현재 진행 중이며, 완성도가 검증되지 않아 이번 제출에는 포함하지 않았다.
 ## 7. 향후 확장 계획
 
 현재는 단일 플랫폼(가상의 OTT 하나)을 가정한 이벤트 스키마로 설계되어 있다.
