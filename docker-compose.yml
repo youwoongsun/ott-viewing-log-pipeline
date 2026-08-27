@@ -1,6 +1,19 @@
-version: "3.8"
-
 # OTT 시청 로그 파이프라인 - 로컬 개발용 Docker Compose
+# 실행: docker compose up -d
+# 종료: docker compose down -v   (볼륨까지 삭제하고 싶을 때)
+#
+# 포함된 서비스:
+#   kafka, postgres        : 파이프라인 본체 (3~4주차)
+#   airflow-postgres        : Airflow 메타데이터 전용 DB (파이프라인 postgres와 분리)
+#   airflow-init/-webserver/-scheduler : Airflow 정식 운영 구성 (5주차)
+#
+# 최초 기동 시 postgres 컨테이너가 init_schema.sql / schema_v2_events.sql을
+# 자동 실행해서 스키마를 만든다 (docker-entrypoint-initdb.d).
+#
+# Airflow 이미지는 Dockerfile.airflow로 직접 빌드한다 (requirements.txt를 이미지에
+# 미리 설치해둠). _PIP_ADDITIONAL_REQUIREMENTS 방식은 컨테이너가 뜰 때마다 재설치를
+# 반복하고, SQLAlchemy 버전이 Airflow 내부 요구사항과 충돌할 위험이 있어 쓰지 않는다.
+# 최초 1회 또는 requirements.txt 변경 시: docker compose build
 
 services:
   kafka:
@@ -9,6 +22,7 @@ services:
     ports:
       - "9092:9092"
     environment:
+      # KRaft 모드 (Zookeeper 없이 단일 브로커로 실행 - 로컬 개발엔 이걸로 충분)
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
@@ -18,7 +32,7 @@ services:
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      CLUSTER_ID: "eHYIrpKZQfW0n_8-uhv4BA"
+      CLUSTER_ID: "p3olP7xmqOF0IzdgfYkjNQ"
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
@@ -38,13 +52,122 @@ services:
       POSTGRES_DB: ott_pipeline
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./sql/init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql
+      # 저장소가 flat 구조라 루트에 있는 두 sql 파일을 그대로 마운트한다.
+      # (파일명이 01_, 02_로 시작해야 순서대로 실행됨 - init_schema가 sessions 등을 먼저 만들고
+      #  그 다음 schema_v2_events가 raw_viewing_events 등을 추가한다)
+      - ./init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql
+      - ./schema_v2_events.sql:/docker-entrypoint-initdb.d/02_schema_v2_events.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ott -d ott_pipeline"]
       interval: 10s
       timeout: 5s
       retries: 10
 
+  # ── Airflow (5주차) ──────────────────────────────────────────
+  # 메타데이터 DB는 파이프라인 postgres와 분리 (스키마 섞이지 않게)
+  airflow-postgres:
+    image: postgres:16
+    container_name: ott-airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # DB 마이그레이션 + 관리자 계정 생성만 하고 종료되는 1회성 컨테이너
+  airflow-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: ott-airflow-init
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create --username admin --password admin \
+          --firstname Admin --lastname User --role Admin --email admin@example.com || true
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: ott-airflow-webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # DAG이 "파이프라인 postgres"에 접속할 때 쓰는 주소.
+      # 로컬(localhost)이 아니라 docker 네트워크 안의 서비스명(postgres)으로 접속해야 함.
+      OTT_PG_DSN: postgresql://ott:ott_pw@postgres:5432/ott_pipeline
+      # DAG 코드가 기본값으로 참조하는 경로. 아래 volumes의 마운트 위치와 반드시 일치해야 함.
+      OTT_PROJECT_DIR: /opt/ott-pipeline
+      # 고정 secret key. 이게 없으면 webserver가 재시작(또는 워커가 여러 개)될 때마다
+      # 랜덤 key가 새로 생성돼서, 재시작 전에 열어둔 폼을 제출하면
+      # "The CSRF token is missing" / "Bad Request" 에러가 난다.
+      AIRFLOW__WEBSERVER__SECRET_KEY: "ott_pipeline_local_dev_secret_key"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      # 프로젝트 루트 전체(스크립트 + data/)를 DAG가 기대하는 경로에 마운트.
+      # 이게 없으면 backfill_ingest.py, spark_batch_preprocess.py, data/*.csv를 찾지 못해 태스크가 실패함.
+      - .:/opt/ott-pipeline
+      # webserver와 scheduler가 로그 폴더를 공유해야 UI에서 실제 태스크 로그를 볼 수 있음.
+      - ./airflow/logs:/opt/airflow/logs
+    ports:
+      - "8080:8080"
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: ott-airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      OTT_PG_DSN: postgresql://ott:ott_pw@postgres:5432/ott_pipeline
+      OTT_PROJECT_DIR: /opt/ott-pipeline
+      # webserver와 반드시 동일한 값이어야 함. 다르면 webserver가 scheduler/worker 컨테이너에서
+      # 실시간 태스크 로그를 가져올 때 "403 FORBIDDEN" / secret_key 불일치 경고가 발생한다.
+      AIRFLOW__WEBSERVER__SECRET_KEY: "ott_pipeline_local_dev_secret_key"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - .:/opt/ott-pipeline
+      - ./airflow/logs:/opt/airflow/logs
+    command: scheduler
+
 volumes:
   kafka_data:
   postgres_data:
+  airflow_postgres_data:

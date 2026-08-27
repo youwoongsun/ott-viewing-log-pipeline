@@ -1,0 +1,31 @@
+# Airflow 웹서버/스케줄러/init 공용 이미지
+# _PIP_ADDITIONAL_REQUIREMENTS 방식(매 컨테이너 기동마다 재설치, SQLAlchemy 충돌 위험) 대신
+# 빌드 시점에 한 번만 프로젝트 의존성을 설치해서 이미지에 구워넣는다.
+FROM apache/airflow:2.9.3
+
+# pyspark(requirements.txt)가 내부적으로 JVM을 띄워야 하는데 베이스 이미지에 Java가 없어서
+# "JAVA_HOME is not set" / "Java gateway process exited" 로 spark_batch_preprocess.py가 죽는다.
+# apt 설치는 root 권한이 필요하므로 잠깐 root로 전환해서 JDK + procps(ps 커맨드, pyspark 스크립트가 사용)를 설치한다.
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openjdk-17-jdk-headless procps \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Debian/Ubuntu에서 openjdk-17의 실제 설치 경로는 아키텍처에 따라 달라질 수 있어
+# (amd64: java-17-openjdk-amd64, arm64: java-17-openjdk-arm64) 하드코딩 대신 심볼릭 링크로 고정 경로를 만든다.
+RUN ln -s "$(dirname "$(dirname "$(readlink -f "$(which javac)")")")" /usr/lib/jvm/default-java
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
+
+# 이후 pip install 등 나머지 빌드 단계는 다시 airflow 유저로 되돌려서 진행 (컨테이너 런타임 유저와 동일하게 유지)
+USER airflow
+
+COPY requirements.txt /requirements.txt
+
+# --constraint 를 반드시 같이 써야 Airflow 2.9.3이 요구하는
+# SQLAlchemy<2.0 등 내부 의존성 범위를 벗어나지 않게 pip가 자동으로 맞춰준다.
+# (이게 빠지면 requirements.txt의 sqlalchemy 버전이 그대로 깔려서
+#  "MappedAnnotationError: Type annotation for TaskInstance.dag_model ..." 로 webserver가 죽는다)
+RUN pip install --no-cache-dir -r /requirements.txt \
+    --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.12.txt"
