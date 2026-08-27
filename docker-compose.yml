@@ -94,7 +94,7 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     volumes:
-      - ./airflow/dags:/opt/airflow/dags
+      - ./dags:/opt/airflow/dags
     entrypoint: /bin/bash
     command:
       - -c
@@ -127,9 +127,9 @@ services:
       # "The CSRF token is missing" / "Bad Request" 에러가 난다.
       AIRFLOW__WEBSERVER__SECRET_KEY: "ott_pipeline_local_dev_secret_key"
     volumes:
-      - ./airflow/dags:/opt/airflow/dags
+      - ./dags:/opt/airflow/dags
       # 프로젝트 루트 전체(스크립트 + data/)를 DAG가 기대하는 경로에 마운트.
-      # 이게 없으면 backfill_ingest.py, spark_batch_preprocess.py, data/*.csv를 찾지 못해 태스크가 실패함.
+      # 이게 없으면 pipeline/backfill_ingest.py, pipeline/spark_batch_preprocess.py, data/*.csv를 찾지 못해 태스크가 실패함.
       - .:/opt/ott-pipeline
       # webserver와 scheduler가 로그 폴더를 공유해야 UI에서 실제 태스크 로그를 볼 수 있음.
       - ./airflow/logs:/opt/airflow/logs
@@ -162,7 +162,7 @@ services:
       # 실시간 태스크 로그를 가져올 때 "403 FORBIDDEN" / secret_key 불일치 경고가 발생한다.
       AIRFLOW__WEBSERVER__SECRET_KEY: "ott_pipeline_local_dev_secret_key"
     volumes:
-      - ./airflow/dags:/opt/airflow/dags
+      - ./dags:/opt/airflow/dags
       - .:/opt/ott-pipeline
       - ./airflow/logs:/opt/airflow/logs
     command: scheduler
