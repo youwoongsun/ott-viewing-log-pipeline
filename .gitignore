@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+data/kafka_sample_bootstrap*.csv
+data/kafka_sample_dup_test.csv
+data/bad_input_sample.csv
+data/viewing_events_part0000.csv
+airflow/logs/
+**/__pycache__/
+.venv311/
+.env

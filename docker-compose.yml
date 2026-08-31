@@ -55,8 +55,8 @@ services:
       # 저장소가 flat 구조라 루트에 있는 두 sql 파일을 그대로 마운트한다.
       # (파일명이 01_, 02_로 시작해야 순서대로 실행됨 - init_schema가 sessions 등을 먼저 만들고
       #  그 다음 schema_v2_events가 raw_viewing_events 등을 추가한다)
-      - ./init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql
-      - ./schema_v2_events.sql:/docker-entrypoint-initdb.d/02_schema_v2_events.sql
+      - ./sql/init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql
+      - ./sql/schema_v2_events.sql:/docker-entrypoint-initdb.d/02_schema_v2_events.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ott -d ott_pipeline"]
       interval: 10s

@@ -226,3 +226,216 @@ Consumer lag 관찰)과 실시간 스트리밍(`spark_session_pipeline.py`)은
 
 이번 프로젝트 범위에서는 단일 플랫폼 기준으로 세션화와 장애 대응을 먼저
 완성도 있게 구현하고, 위 확장은 시간 여유가 있을 경우 다음 단계로 진행할 예정이다.
+
+## 8. 7주차: 실시간 스트리밍 파이프라인 부하 테스트 및 장애 5종 재현
+
+6주차까지는 Airflow 배치 파이프라인을 파라미터화하고 대용량(ml-25m 기반
+2,000만 건) 처리 안정화에 집중했다면, 7주차는 진행 중이던 실시간 스트리밍
+파이프라인(`spark_session_pipeline.py`, Kafka → Spark Structured Streaming
+→ PostgreSQL)을 실제로 붙여서 ① 대용량 부하를 견디는지, ② 장애 상황
+5가지에서 어떻게 동작하는지를 직접 재현하고 기록했다.
+
+### 8-1. 사전 준비 (매 새 터미널)
+
+```powershell
+cd "C:\Users\User\Desktop\ott-pipeline-clean"
+.venv311\Scripts\activate
+```
+
+- **producer 터미널**: `kafka_producer.py`로 CSV를 Kafka `viewing-events`
+  토픽에 전송
+- **스트리밍 터미널**: `spark-submit`으로 `spark_session_pipeline.py` 실행
+  (Kafka 컨슘 → `mapGroupsWithState` 세션화 → PostgreSQL upsert)
+- **쿼리 터미널**: `docker exec`로 PostgreSQL 조회/기록
+
+```powershell
+set PYSPARK_PYTHON=%VIRTUAL_ENV%\Scripts\python.exe
+spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 pipeline\spark_session_pipeline.py
+```
+
+### 8-2. 0단계 — 기준선(baseline) 기록
+
+원본 샘플(`kafka_sample_2000.csv`, 1,910건)을 rate=500/s로 전송.
+
+![](load_test_screenshots/baseline_producer.png)
+![](load_test_screenshots/baseline_streaming_batch.png)
+
+전송 완료(1,910건, 5.4초) 후 세션화 결과:
+
+| sessions | total_events |
+|---|---|
+| 73 | 1909 |
+
+![](load_test_screenshots/baseline_query_result.png)
+
+```sql
+INSERT INTO failure_experiments (scenario, started_at, ended_at, notes)
+VALUES ('baseline', now(), now(), '1910건 기준선: 73개 세션 upsert')
+RETURNING experiment_id;
+```
+
+### 8-3. 1단계 — 대용량 실행 (500만 건)
+
+`bootstrap_sample.py`로 원본 1,910건을 부트스트랩 샘플링하여 500만 건
+CSV(`kafka_sample_bootstrap_5m.csv`)를 생성한 뒤, `sessions` 테이블을
+TRUNCATE하고 rate 제한 없이(`--rate 0`) 전송했다.
+
+```
+전송 완료: 총 5,000,000건 (실패 0건) | 3365.5초 소요 (약 56분)
+```
+
+![](load_test_screenshots/bulk_5m_producer_complete.png)
+
+전송 후 워터마크 처리 대기(2~3분) 후 세션화 결과:
+
+| sessions | total_events |
+|---|---|
+| 66,156 | 1,707,541 |
+
+![](load_test_screenshots/bulk_5m_query_result.png)
+
+500만 건 규모에서도 producer 전송 실패 0건, 스트리밍 세션화까지 크래시
+없이 완주하는 것을 확인했다. (단, 이 수치는 2단계 (A) 장애 재현 중 발생한
+체크포인트 초기화 이전 시점의 값이며, 최종 정합성은 8-5의 3단계 최종
+검증 수치를 기준으로 한다.)
+
+### 8-4. 2단계 — 장애 5종 재현
+
+500만 건 재전송 없이, 매 시나리오마다 작은 파일로 별도 진행했다.
+
+#### (A) 잘못된 입력 (invalid_input)
+
+`user_id`에 문자열, `event_timestamp`에 `garbage-date`, `movie_id`에 빈
+값을 섞은 20건짜리 CSV를 전송했다.
+
+![](load_test_screenshots/invalid_input_producer.png)
+
+**1차 시도**: batch 41까지는 정상 처리되다가, `garbage-date`가 내부적으로
+비정상 범위의 타임스탬프로 변환되면서 `write_to_postgres`에서
+`datetime.fromtimestamp()` 호출 시 `OSError: [Errno 22] Invalid argument`가
+발생, `StreamingQueryException`으로 전파되어 스트리밍 쿼리가 크래시했다.
+
+```
+File "spark_session_pipeline.py", line 146, in write_to_postgres
+    rows = batch_df.collect()
+...
+OSError: [Errno 22] Invalid argument
+```
+
+**재시작 시 재크래시**: `startingOffsets=earliest` 설정 때문에 체크포인트를
+지우고 재시작해도 Kafka에 남아있던 동일한 bad 레코드를 처음부터 다시 읽어
+같은 지점에서 재크래시했다. `startingOffsets`를 `latest`로 변경한 뒤에야
+정상적으로 재개됐다 — **잘못된 타입의 이벤트 하나가 스트리밍 쿼리 전체를
+중단시킬 수 있고, 재시작 전략(offset 정책)에 따라 장애가 반복될 수 있다는
+것을 확인한 부분**이다.
+
+```sql
+INSERT INTO failure_experiments (scenario, started_at, ended_at, notes)
+VALUES ('invalid_input', now(), now(),
+  'garbage-date 타입 오류 레코드 전송 시 event_timestamp 파싱값이 비정상 범위로
+   변환되어 datetime.fromtimestamp에서 OSError(Errno 22) 발생,
+   StreamingQueryException으로 전파되어 스트리밍 쿼리 크래시(batch 41 이후 종료).
+   earliest offset 재시도로 동일 지점에서 재크래시 확인,
+   startingOffsets를 latest로 변경 후 정상 재개')
+RETURNING experiment_id;
+```
+
+#### (B) Kafka 브로커 다운 (kafka_broker_down)
+
+500만 건 파일을 rate=500으로 전송하는 중 `docker restart ott-kafka`로
+브로커를 재시작했다.
+
+```
+WARN NetworkClient: [AdminClient clientId=adminclient-1] Connection to
+node 1 (localhost/127.0.0.1:9092) could not be established. Broker may
+not be available.
+[batch 3] 718건 세션 upsert 완료
+[batch 4] 227건 세션 upsert 완료
+[batch 5] 193건 세션 upsert 완료
+```
+
+연결 실패 WARN만 찍히고 스트리밍 쿼리는 **크래시하지 않고 자동 재연결**
+후 batch 처리를 이어갔다. Kafka consumer의 재시도 로직이 정상 동작함을
+확인했다.
+
+#### (C) Spark 강제 종료 (spark_task_killed)
+
+500만 건 파일 전송 중(약 15,000건 시점) 스트리밍 터미널에서 `Ctrl+C`로
+강제 종료했다. 정상적으로 셧다운 훅이 실행되며 종료됐고, producer도 곧바로
+`Ctrl+C`로 함께 중단했다.
+
+#### (D) DB 적재 실패 (db_write_failure)
+
+스트리밍을 재시작한 뒤 `docker stop ott-postgres`로 PostgreSQL을 내렸다.
+워터마크가 지나 세션이 실제로 닫히는 시점(재시작 후 약 6분 뒤)에
+`write_to_postgres`가 커넥션을 시도하다가 크래시했다.
+
+```
+File "spark_session_pipeline.py", line 153, in write_to_postgres
+    conn = psycopg2.connect(PG_DSN)
+psycopg2.OperationalError: connection to server at "localhost" (::1),
+port 5432 failed: Connection refused (0x0000274D/10061)
+```
+
+![](load_test_screenshots/db_write_failure_error.png)
+
+`docker start ott-postgres` 후 정상 재개를 확인했다.
+
+#### (E) 동일 이벤트 중복 전송 (duplicate_event_replay)
+
+5만 건 서브셋(`kafka_sample_dup_test.csv`)을 동일하게 3회 반복 전송했다.
+
+```
+전송 완료: 총 50,000건 (실패 0건) | 20.6초 소요   (1회)
+전송 완료: 총 50,000건 (실패 0건) | 20.7초 소요   (2회)
+전송 완료: 총 50,000건 (실패 0건) | 20.1초 소요   (3회)
+```
+
+스트리밍은 크래시 없이 정상 처리됐고(batch 15~17 upsert 성공), 중복 체크
+쿼리 결과 **0행**으로 `dropDuplicates` 기반 중복 제거 로직이 정상 동작함을
+확인했다.
+
+```sql
+SELECT session_id, count(*) FROM sessions
+GROUP BY session_id HAVING count(*) > 1;
+-- (0 rows)
+```
+
+### 8-5. 3단계 — 최종 정합성 검증
+
+| sessions | total_events |
+|---|---|
+| 66,734 | 1,723,224 |
+
+중복 세션 존재 여부(`count(*) > 1`) 재확인 결과도 **0행**으로, 장애 5종을
+모두 통과한 뒤에도 세션 중복이 발생하지 않았음을 확인했다.
+
+### 8-6. 장애 실험 결과 요약
+
+| # | 시나리오 | 스트리밍 크래시 여부 | 비고 |
+|---|---|---|---|
+| 1 | baseline | - | 1,910건 → 73세션 |
+| 2 | invalid_input | **크래시** | garbage-date → OSError → StreamingQueryException |
+| 3 | invalid_input (재시도) | **크래시** | earliest offset으로 동일 지점 재크래시, latest로 변경 후 해결 |
+| 4 | kafka_broker_down | 크래시 없음 | 자동 재연결로 정상 처리 지속 |
+| 5 | spark_task_killed | (의도적 종료) | Ctrl+C 정상 셧다운 |
+| 6 | db_write_failure | **크래시** | Connection refused → 재시작 후 정상화 |
+| 7 | duplicate_event_replay | 크래시 없음 | 3회 중복 전송에도 세션 중복 0건 |
+
+**배운 점**:
+- 데이터 자체의 결함(잘못된 타입/포맷)은 인프라 장애(브로커 다운)보다
+  스트리밍 쿼리에 더 치명적이다 — 후자는 자동 복구되지만 전자는 쿼리
+  자체를 중단시킨다.
+- `startingOffsets` 정책(earliest/latest)이 장애 복구 전략에 큰 영향을
+  준다. earliest로 두면 문제 레코드가 Kafka에 남아있는 한 재시작해도
+  같은 지점에서 반복 크래시할 수 있다.
+- `dropDuplicates` 기반 세션화 로직은 중복 이벤트 재전송에 대해 안정적으로
+  동작했다.
+
+### 8-7. 진행 중 / 다음 단계
+
+- 체크포인트 초기화(offset 정책 변경)가 발생한 시점 전후로 집계 수치가
+  달라질 수 있다는 점을 발견했다. 다음 단계에서는 재현성을 위해 체크포인트
+  디렉토리를 시나리오별로 분리하는 것을 고려 중이다.
+- README에는 대표 캡처만 남기고, 전체 로그는 별도 `LOAD_AND_FAULT_TEST.md`에
+  정리할 예정이다.
