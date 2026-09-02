@@ -67,12 +67,14 @@ MovieLens는 "유저가 영화에 평점을 남겼다"는 정적 스냅샷이지
        │                                    
        ▼                                    
   [Spark Structured Streaming]              
-  - mapGroupsWithState 기반 세션화          
-    (30분 무활동 시 세션 종료, watermark로  
-     late data 처리)                        
+  - session_window(30분) 기반 세션화        
+    (user_id, movie_id별 그룹화, watermark  
+     10분으로 late data 처리)               
+  - dropDuplicates(event_id)로 동일 이벤트  
+    재전송 방지                             
        │                                    
        ▼                                    
-  [PostgreSQL: sessions 테이블] ◀── JOIN ── [영화 메타 테이블]
+  [PostgreSQL: sessions 테이블] (session_id는 xxhash64 해시, upsert 저장)
        │
        ▼
   [Airflow DAG] — 일 배치로 랭킹/지표 재계산, retry/backoff, 품질 체크
@@ -97,16 +99,45 @@ MovieLens는 "유저가 영화에 평점을 남겼다"는 정적 스냅샷이지
 ### 3-2. Spark 처리 설계
 
 - Kafka Consumer로 이벤트를 읽어 파싱
-- `mapGroupsWithState`로 user_id별 상태를 유지하며 세션 판정
-- 세션 종료 조건: 마지막 이벤트 이후 30분 무활동
-- watermark: late data(네트워크 지연 등으로 늦게 도착하는 이벤트) 처리를 위해 설정, 구체적인 지연 허용 범위는 실험 후 확정
-- 세션 요약 시 영화 메타데이터와 조인하여 장르 정보 포함
+- **(계획 대비 변경)** 당초 `mapGroupsWithState`로 커스텀 상태 관리를 계획했으나,
+  구현 단계에서 Spark 내장 `session_window(event_time, "1800 seconds")`로
+  대체했다. `(user_id, movie_id)` 기준으로 그룹화하면 동일한 결과(30분
+  무활동 시 세션 분리)를 더 적은 코드로, 직접 상태를 관리하는 부담 없이
+  얻을 수 있어서 커스텀 state 관리보다 이 방식을 택했다.
+- 세션 종료 조건: 마지막 이벤트 이후 30분(`SESSION_TIMEOUT_SEC=1800`) 무활동
+- watermark: 10분(`WATERMARK_DELAY`)으로 확정. late data(네트워크 지연 등으로
+  늦게 도착하는 이벤트)를 이 범위까지는 같은 세션으로 인정하고, 그 이후 도착분은
+  버린다.
+- `dropDuplicates(["event_id"])`: watermark 범위 내에서 동일 `event_id`가
+  중복 도착하면 제거 — producer 재시도나 실수로 같은 데이터를 재전송해도
+  세션 집계가 부풀지 않도록 하는 안전장치. (E) 장애 실험(8-4)에서 실제로
+  검증됨.
+- 세션 식별자(`session_id`)는 원본 문자열 세션ID(`u{user}-m{movie}-s{n}`)를
+  `xxhash64`로 해시한 BIGINT — 재시작/재처리 후에도 같은 세션이 항상 같은
+  키로 매핑되어야 PostgreSQL upsert가 "새 행 추가"가 아니라 "기존 행 갱신"으로
+  동작하기 때문
+- 세션 집계 시 원본 이벤트의 `genre` 값을 `genre_list`(text[])로 저장 (현재는
+  이벤트 자체에 이미 포함된 대표 장르 1개만 담는 형태이며, 영화 메타 테이블과의
+  실제 JOIN 보강은 아직 붙이지 않음 — 8-7 참고)
 
 ### 3-3. 저장 설계
 
 - PostgreSQL 단일 사용
 - 이유: 원본 이벤트 전체가 아니라 Spark가 집계한 세션 단위 결과만 저장하므로, 대용량 분산 저장(Parquet 등)보다는 관계형 구조(세션-영화-장르 조인)에 적합한 PostgreSQL이 더 알맞다고 판단
-- 예상 스키마 (확정 아님): `sessions(session_id, user_id, movie_id, start_ts, end_ts, event_count, completion_rate)`
+- **확정 스키마** (`sql/init_schema.sql`):
+
+  | 컬럼 | 타입 | 설명 |
+  |---|---|---|
+  | `session_id` | `bigint` (PK) | 원본 문자열 세션ID의 `xxhash64` 해시 |
+  | `user_id` / `movie_id` | `integer` | |
+  | `start_ts` / `end_ts` | `timestamptz` | 세션 시작/종료 시각 |
+  | `event_count` | `integer` | 세션 내 이벤트 수 |
+  | `completed` | `boolean` | `session_end` 이벤트 존재 여부로 판정 |
+  | `completion_rate` | `numeric(4,3)` | `max_position_sec / duration_sec` |
+  | `genre_list` | `text[]` | 대표 장르 |
+  | `ingested_at` | `timestamptz` | upsert 시각 (기본값 `now()`) |
+
+  인덱스: `session_id`(PK), `movie_id`, `start_ts`, `user_id`
 
 ### 3-4. Airflow 설계
 
@@ -119,7 +150,7 @@ MovieLens는 "유저가 영화에 평점을 남겼다"는 정적 스냅샷이지
 | 컴포넌트 | 후보 | 선정 이유 |
 |---|---|---|
 | 데이터 수집 | Kafka (local) | Producer/Consumer 디커플링, 장애 시 디스크 기반 재처리 가능 |
-| 가공/집계 | Spark Structured Streaming | 세션화(mapGroupsWithState), 윈도우 집계·조인이 복잡해 Pandas보다 적합 |
+| 가공/집계 | Spark Structured Streaming | 세션화(session_window), 윈도우 집계가 복잡해 Pandas보다 적합 |
 | 워크플로우 관리 | Airflow (local) | 일 배치 재계산 + retry/backoff 실습, cron 대비 의존성 관리와 모니터링이 용이 |
 | 저장소 | PostgreSQL | 집계 결과가 관계형 구조(세션-영화-장르)라 JOIN이 잦음 |
 | API 서빙 (선택) | FastAPI | 세션 기반 집계 결과 조회 엔드포인트 |
@@ -205,11 +236,31 @@ quality_check`) 전부 성공했다.
 - `extract_window`: 원본 전체를 메모리에 올리던 방식을 청크 단위 스캔으로
   변경
 
-### 진행 중 (이번 제출 범위 밖)
+### fallback(retry) 실제 동작 확인
 
-장애 주입 실험(Kafka 브로커 재시작, Spark 강제 종료 후 체크포인트 복구,
-Consumer lag 관찰)과 실시간 스트리밍(`spark_session_pipeline.py`)은
-현재 진행 중이며, 완성도가 검증되지 않아 이번 제출에는 포함하지 않았다.
+`default_args`에 설정한 `retries=3`(지수 백오프)이 실제로 발동한 사례가
+있다. 대용량(ml-25m) 처리 안정화 과정에서 `spark_process` 태스크가:
+
+1. 1차 시도: `--input-format` 인자 누락으로 argparse 실패 → `up_for_retry`
+2. 2차 시도(자동 재시도): `JAVA_HOME` 미설정으로 실패 → `up_for_retry`
+3. 3차 시도(자동 재시도): 코드 수정 반영 후 성공
+
+순서로 Grid 뷰에서 빨강→노랑→초록으로 표시되는 것을 실제로 관찰했다
+(스크린샷은 6주차 `airflow_screenshots/` 참고). 코드 버그로 인한 실패였지만,
+**Airflow의 자동 재시도 자체는 설계대로 정확히 3회까지 동작함**을 확인한
+사례다.
+
+`quality_check` 태스크는 `window_count == 0`이면 `AirflowFailException`을
+던지도록 설계된 일종의 alert(품질 게이트)인데, 지금까지의 실행에서는
+조건에 맞는 데이터가 항상 존재해 **실제로 트리거된 적은 없다** —
+검증되지 않은 상태로 남아있는 부분이다 (8-7 참고).
+
+### 완료됨: 실시간 스트리밍 및 장애 주입 실험
+
+장애 주입 실험(Kafka 브로커 다운, Spark 강제 종료 후 체크포인트 복구,
+DB 적재 실패, 동일 이벤트 중복 전송, 잘못된 입력)과 실시간 스트리밍
+(`spark_session_pipeline.py`)은 7주차(8장)에서 완료했다. 아래는 그 결과다.
+
 ## 7. 향후 확장 계획
 
 현재는 단일 플랫폼(가상의 OTT 하나)을 가정한 이벤트 스키마로 설계되어 있다.
@@ -245,7 +296,8 @@ cd "C:\Users\User\Desktop\ott-pipeline-clean"
 - **producer 터미널**: `kafka_producer.py`로 CSV를 Kafka `viewing-events`
   토픽에 전송
 - **스트리밍 터미널**: `spark-submit`으로 `spark_session_pipeline.py` 실행
-  (Kafka 컨슘 → `mapGroupsWithState` 세션화 → PostgreSQL upsert)
+  (Kafka 컨슘 → `session_window` 세션화 → PostgreSQL upsert, 상세 설계는
+  3-2 참고)
 - **쿼리 터미널**: `docker exec`로 PostgreSQL 조회/기록
 
 ```powershell
@@ -298,6 +350,28 @@ TRUNCATE하고 rate 제한 없이(`--rate 0`) 전송했다.
 없이 완주하는 것을 확인했다. (단, 이 수치는 2단계 (A) 장애 재현 중 발생한
 체크포인트 초기화 이전 시점의 값이며, 최종 정합성은 8-5의 3단계 최종
 검증 수치를 기준으로 한다.)
+
+### 8-3-1. 기준 실행 vs 대용량 실행 비교
+
+| 항목 | 기준 실행 | 대용량 실행 |
+|---|---|---|
+| 입력 건수 | 1,910건 | 5,000,000건 |
+| 전송 소요시간 | 5.4초 | 3,365.5초 (약 56분) |
+| 처리량(전송) | 약 354건/초 | 약 1,486건/초 |
+| 전송 실패 건수 | 0건 | 0건 |
+| 최종 저장 세션 수 | 73개 | 66,156개 |
+| 최종 저장 이벤트 합계 | 1,909건 | 1,707,541건 |
+| 입력 대비 미반영 건수 | 1건 (0.05%) | 3,292,459건 (65.8%) |
+
+**미반영 건수에 대한 설명**: 기준 실행은 1건 차이라 사실상 오차 범위지만,
+대용량 실행은 65.8%나 차이가 나서 무시할 수 없는 수준이다. 원인을
+확정하지는 못했고(8-7 참고), 가장 유력한 가설은 `bootstrap_sample.py`가
+같은 47~73개 원본 세션을 반복 복제하는 과정에서 `(user_id, movie_id)`
+쌍과 타임스탬프가 겹치는 이벤트가 대량 발생했고, `session_window`가
+이들을 서로 다른 세션이 아니라 **하나의 세션으로 병합**해버렸다는
+것이다. 즉 이벤트 자체가 유실된 게 아니라, 의도와 다르게 더 큰
+세션 하나로 뭉쳐져 집계됐을 가능성이 높다 — 이 부분은 로그 레벨에서
+직접 검증이 필요한 남은 작업이다.
 
 ### 8-4. 2단계 — 장애 5종 재현
 
@@ -432,10 +506,128 @@ GROUP BY session_id HAVING count(*) > 1;
 - `dropDuplicates` 기반 세션화 로직은 중복 이벤트 재전송에 대해 안정적으로
   동작했다.
 
-### 8-7. 진행 중 / 다음 단계
+### 8-7. 아직 실행되지 않은 단계 / 남은 작업
 
+- **전송 건수 대비 저장 건수 차이** (8-3-1 참고): 500만 건 전송했는데
+  최종 `total_events`는 170만 건대로, 65.8% 차이가 난다. 세션 병합
+  가설을 세워뒀지만 로그 레벨에서 확정 검증은 아직 못했다.
 - 체크포인트 초기화(offset 정책 변경)가 발생한 시점 전후로 집계 수치가
   달라질 수 있다는 점을 발견했다. 다음 단계에서는 재현성을 위해 체크포인트
   디렉토리를 시나리오별로 분리하는 것을 고려 중이다.
+- `quality_check`(alert 역할)가 실제로 트리거된 적이 없다 — 일부러 조건에
+  안 맞는 backfill을 실행해 alert가 실제로 발동하는지 확인하는 실험이
+  남아있다.
+- TMDB API로 영화 메타데이터(장르, 포스터 등)를 보강하는 부분은 설계만
+  해두고 실제 `sessions` 결과와 조인해서 쓰는 단계까지는 아직 못 붙였다.
+- `airflow/dags/daily_batch_dag.py`(일 배치 랭킹/리텐션 재계산)는 코드는
+  있으나 이번 제출에서 실제로 트리거해서 검증하지는 않았다.
+- 정규화 계층/스키마 레지스트리(7장)는 아직 시작 전.
 - README에는 대표 캡처만 남기고, 전체 로그는 별도 `LOAD_AND_FAULT_TEST.md`에
-  정리할 예정이다.
+  정리했다.
+
+## 9. 실행 결과 확인 방법 (Kafka·Spark·저장소·Airflow)
+
+각 컴포넌트가 정상 동작 중인지, 지금까지 몇 건이나 처리했는지 확인하는
+방법을 한곳에 정리한다.
+
+### Kafka
+
+```powershell
+# 토픽 존재 확인
+docker exec -it ott-kafka kafka-topics --bootstrap-server localhost:9092 --list
+
+# 파티션별 최신 오프셋(=지금까지 쌓인 메시지 총량) 확인
+docker exec -it ott-kafka kafka-run-class kafka.tools.GetOffsetShell --broker-list localhost:9092 --topic viewing-events
+
+# 컨슈머 그룹 lag 확인 (그룹명은 --list로 먼저 확인)
+docker exec -it ott-kafka kafka-consumer-groups --bootstrap-server localhost:9092 --list
+docker exec -it ott-kafka kafka-consumer-groups --bootstrap-server localhost:9092 --describe --group <그룹명>
+```
+
+### Spark (Structured Streaming)
+
+- 스트리밍 실행 중에는 `http://localhost:4040` (Spark UI)에서 `Structured
+  Streaming` 탭으로 배치별 처리 건수·지연시간을 실시간으로 볼 수 있다.
+- 터미널 로그에서 `[batch N] M건 세션 upsert 완료` 줄을 grep하면 배치별
+  처리 건수를 시간순으로 확인 가능:
+  ```powershell
+  spark-submit ... pipeline\spark_session_pipeline.py | findstr "upsert"
+  ```
+
+### 저장소 (PostgreSQL)
+
+```powershell
+# 전체 처리 현황
+docker exec -it ott-postgres psql -U ott -d ott_pipeline -P pager=off -c "SELECT count(*) AS sessions, sum(event_count) AS total_events FROM sessions;"
+
+# 중복 여부 (정합성 검증)
+docker exec -it ott-postgres psql -U ott -d ott_pipeline -P pager=off -c "SELECT session_id, count(*) FROM sessions GROUP BY session_id HAVING count(*) > 1;"
+
+# 장애 실험 이력 전체
+docker exec -it ott-postgres psql -U ott -d ott_pipeline -P pager=off -c "SELECT * FROM failure_experiments ORDER BY experiment_id;"
+```
+
+### Airflow
+
+- 웹 UI: `http://localhost:8080` → DAG 선택 → Grid 뷰에서 태스크별 성공/실패/재시도 색상 확인
+- CLI:
+  ```powershell
+  docker exec -it ott-airflow-scheduler airflow dags list-runs -d backfill_ingest_process_dag
+  ```
+
+## 10. 저장 결과 조회 API (FastAPI)
+
+`sessions` 테이블에 저장된 결과를 파이프라인 밖에서 실제로 조회해볼 수
+있도록 최소 기능의 read-only API(`pipeline/api.py`)를 추가했다. 대시보드나
+추천 모델까지는 이번 범위에 포함하지 않고, "저장된 결과를 외부에서 조회할
+수 있다"는 것 자체를 검증하는 목적이다.
+
+### 실행
+
+```powershell
+pip install fastapi uvicorn
+uvicorn pipeline.api:app --reload --port 8000
+```
+
+`http://127.0.0.1:8000/docs`에서 Swagger UI로 바로 확인 가능.
+
+### 요청/응답 예시
+
+Swagger UI(`/docs`)에서 직접 Execute해서 확인한 실제 응답이다.
+
+```
+GET http://127.0.0.1:8000/stats
+```
+```json
+{
+  "total_sessions": 66734,
+  "total_events": 1723224,
+  "avg_completion_rate": 0.948,
+  "completed_sessions": 56829
+}
+```
+![API /stats 응답](load_test_screenshots/api_stats_response.png)
+
+```
+GET http://127.0.0.1:8000/sessions?limit=20
+```
+```json
+[
+  {
+    "session_id": 1823029408626545200,
+    "user_id": 8365,
+    "movie_id": 471,
+    "start_ts": "2009-08-13T08:48:31.577995+00:00",
+    "end_ts": "2009-08-13T09:19:02.802670+00:00",
+    "event_count": 20,
+    "completed": true,
+    "completion_rate": 1.0,
+    "genre_list": ["Comedy"],
+    "ingested_at": "2026-08-31T04:04:02.619852+00:00"
+  }
+]
+```
+![API /sessions 응답](load_test_screenshots/api_sessions_response.png)
+
+(정확한 수치는 `sessions` 테이블 현재 상태에 따라 달라진다 — 위는 실제
+로컬 조회 시점 기준 응답 예시)
