@@ -157,4 +157,27 @@ with DAG(
         python_callable=quality_check,
     )
 
-    t1_extract >> t2_ingest >> t3_spark >> t4_check
+    def read_result(**context):
+        """5. 서빙(읽기): spark_process가 방금 저장한 parquet 결과를 실제로 읽어
+        본다. 이 태스크 하나로 이번 DAG run이 '수집 -> 적재 -> 가공/저장 -> 읽기'
+        전 과정을 하나의 실행으로 재현했음을 증명한다 (새 저장소나 API를 새로
+        만들지 않고, 이미 만든 산출물을 그대로 읽는다).
+        """
+        import pandas as pd
+
+        tag = context["ti"].xcom_pull(task_ids="extract_window", key="tag")
+        out_dir = f"{WORK_DIR}/{tag}/spark_output"
+        df = pd.read_parquet(out_dir)
+
+        print(f"[read_result] 읽은 경로: {out_dir}")
+        print(f"[read_result] 저장된 세션 수: {len(df):,}")
+        print("[read_result] 상위 5건:")
+        print(df.head(5).to_string())
+        return len(df)
+
+    t5_read = PythonOperator(
+        task_id="read_result",
+        python_callable=read_result,
+    )
+
+    t1_extract >> t2_ingest >> t3_spark >> t4_check >> t5_read
