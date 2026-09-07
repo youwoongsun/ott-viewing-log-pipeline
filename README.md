@@ -34,19 +34,23 @@ OTT(넷플릭스, 왓챠 등) 서비스의 시청 이벤트를 실시간으로 �
 
 출처: https://grouplens.org/datasets/movielens/
 
-### 2-2. TMDB API
+### 2-2. TMDB API (계획 — 아직 실제 연동 안 됨)
 
-영화 메타데이터(장르, 개봉일, 러닝타임, 포스터 등)를 보강하기 위해서 사용한다. `links.csv`의 tmdbId로 조회한다.
+영화 메타데이터(장르, 개봉일, 러닝타임, 포스터 등)를 보강할 **계획**으로
+조사해둔 API. 현재 코드에는 실제 호출/조인 로직이 없고, 세션 결과의
+`genre_list`는 이벤트 자체에 이미 담긴 대표 장르 1개만 사용한다
+(8-7 남은 작업 참고).
 
 - 문서: https://developer.themoviedb.org/docs/getting-started
-- 개인/비상업(Developer) 등급으로 신청 후 무료 사용
-- API 키는 `.env` 파일로 관리하고 `.gitignore`로 제외 (레포에 노출되지 않음)
+- 개인/비상업(Developer) 등급으로 신청 후 무료 사용 가능 (실제 신청은 안 함)
 
 ### 2-3. 자체 이벤트 생성기
 
 MovieLens는 "유저가 영화에 평점을 남겼다"는 정적 스냅샷이지, "재생했다가 스킵했다" 같은 세분화된 시청 행동 로그가 아니다. 따라서 평점 타임스탬프를 기준점으로 삼아서, 그 전후로 아래와 같은 이벤트를 생성한다.
 
-- `play`, `pause`, `seek`, `complete`, `drop` 이벤트를 순서대로 생성
+- `session_start`, `segment_watch`(재생 구간), `session_end` 이벤트를 순서대로 생성
+  (최초 계획은 `play`/`pause`/`seek`/`complete`/`drop`이었으나, 실제 구현은
+  세션 경계 판정에 필요한 최소 이벤트 종류로 단순화했다)
 - 시청 지속시간: 로그정규분포 (대부분 짧게 이탈, 소수는 끝까지 시청하는 패턴 반영)
 - 콘텐츠 인기 쏠림: 파레토 분포 (소수 인기작에 시청 이벤트가 몰리는 실제 서비스 패턴 반영)
 
@@ -88,22 +92,6 @@ MovieLens는 "유저가 영화에 평점을 남겼다"는 정적 스냅샷이지
      consumer lag 관찰 및 대응
   → 결과를 "시나리오 → 발생 문제 → 대응 → 결과" 표로 README에 기록
 ```
-
-### 인터랙티브 아키텍처 다이어그램
-
-위 텍스트 흐름도를 [Archify](https://github.com/tt-a1i/archify)로 검증 가능한
-형태로 다시 그렸다. `diagrams/ott-pipeline-architecture.html`을 다운로드해
-브라우저로 열면(더블클릭) 아래 4개 뷰를 전환하며 볼 수 있다.
-
-- **배치 경로**: CSV → Airflow → Spark 배치 → Quality Gate → PostgreSQL
-- **실시간 경로**: Producer → Kafka → Spark Streaming → PostgreSQL
-- **저장 결과 조회**: PostgreSQL → FastAPI → Client
-- **장애 대응**: Kafka/Spark/PostgreSQL ↔ `failure_experiments` 기록 흐름
-
-컴포넌트를 클릭하면 upstream/downstream 추적, 테마 전환(다크/라이트), PNG/SVG
-내보내기가 가능하다. 정적 미리보기:
-
-![OTT 파이프라인 구성도](diagrams/ott-pipeline-architecture.png)
 
 ### 3-1. Kafka 설계
 
@@ -223,6 +211,9 @@ Airflow `Param`으로 받는다.
    해시 기반 멱등성 처리
 3. `spark_process` — `spark_batch_preprocess.py`(Spark)로 세션 단위 집계
 4. `quality_check` — 처리 건수가 0건이면 실패 처리
+5. `read_result` — spark_process가 저장한 parquet 결과를 실제로 읽어서
+   건수와 상위 5건을 로그로 출력 (수집→적재→가공/저장→읽기 전 과정을
+   하나의 DAG 실행으로 재현, 11장 참고)
 
 ### 재실행 검증
 
@@ -294,10 +285,10 @@ DB 적재 실패, 동일 이벤트 중복 전송, 잘못된 입력)과 실시간
 이번 프로젝트 범위에서는 단일 플랫폼 기준으로 세션화와 장애 대응을 먼저
 완성도 있게 구현하고, 위 확장은 시간 여유가 있을 경우 다음 단계로 진행할 예정이다.
 
-## 8. 7주차: 실시간 스트리밍 파이프라인 부하 테스트 및 장애 5종 재현
+## 8. 실시간 스트리밍 파이프라인 부하 테스트 및 장애 5종 재현
 
-6주차까지는 Airflow 배치 파이프라인을 파라미터화하고 대용량(ml-25m 기반
-2,000만 건) 처리 안정화에 집중했다면, 7주차는 진행 중이던 실시간 스트리밍
+이전까지는 Airflow 배치 파이프라인을 파라미터화하고 대용량(ml-25m 기반
+2,000만 건) 처리 안정화에 집중했다면, 이번에는 진행 중이던 실시간 스트리밍
 파이프라인(`spark_session_pipeline.py`, Kafka → Spark Structured Streaming
 → PostgreSQL)을 실제로 붙여서 ① 대용량 부하를 견디는지, ② 장애 상황
 5가지에서 어떻게 동작하는지를 직접 재현하고 기록했다.
@@ -647,3 +638,95 @@ GET http://127.0.0.1:8000/sessions?limit=20
 
 (정확한 수치는 `sessions` 테이블 현재 상태에 따라 달라진다 — 위는 실제
 로컬 조회 시점 기준 응답 예시)
+
+## 11. 서빙 레이어 연결 및 end-to-end 단일 실행
+
+지금까지 만든 것들(수집·처리·저장·조회)을 새로 안 만들고 하나로 이었다.
+
+### 11-1. 서빙 — 저장 결과를 읽는 장면
+
+10장의 FastAPI(`pipeline/api.py`)가 그 장면이다. `sessions` 테이블(스트리밍
+파이프라인의 최종 저장소)을 `/stats`, `/sessions`로 조회하는 요청·응답을
+그대로 재사용한다. 새 대시보드나 API를 별도로 만들지 않고, 이미 있는
+결과를 실제로 읽어서 보여주는 것 자체가 목적이다.
+
+### 11-2. 끝까지 이어진 실행 기록 하나
+
+`backfill_ingest_process_dag.py`에 마지막 태스크 `read_result`를 추가해서,
+**Airflow DAG 실행 한 번**으로 입력→처리→저장→읽기 전 과정이 재현되도록
+연결했다.
+
+```
+extract_window(입력 필터링) → ingest_events(적재) → spark_process(가공·저장)
+    → quality_check(검증) → read_result(저장된 parquet을 실제로 읽어서 로그 출력)
+```
+
+**한 번의 트리거로 실행:**
+```powershell
+docker exec -it ott-airflow-scheduler airflow dags trigger backfill_ingest_process_dag --conf "{\"start_date\": \"2018-01-01\", \"end_date\": \"2018-12-31\", \"genre\": \"\", \"source_path\": \"\"}"
+```
+기본 샘플(`kafka_sample_2000.csv`, 1,910행) 기준이라 5개 태스크 전부 합쳐
+**1~2분 내**에 끝나고, 실패해도 같은 명령으로 재실행하면 되는 안전한
+범위다. `read_result` 태스크 로그에 `[read_result] 저장된 세션 수: N`과
+상위 5건이 출력되는 것으로 "저장된 걸 실제로 읽었다"를 확인한다.
+
+**실제 실행 결과** (`start_date=2018-01-01, end_date=2018-12-31`, 전체 장르):
+
+```
+[read_result] 읽은 경로: /tmp/ott_backfill/2018-01-01_2018-12-31/spark_output
+[read_result] 저장된 세션 수: 21
+[read_result] 상위 5건:
+   session_id       user_id  movie_id  movie_title                                          genre    device    ...
+   u8665-m106782-s1 8665     106782    Wolf of Wall Street, The (2013)                       Comedy   tablet    ...
+   u100354-m63992-s1 100354  63992     Twilight (2008)                                       Drama    web       ...
+   u51297-m6539-s1   51297   6539      Pirates of the Caribbean: The Curse of the Black Pearl Action   smart_tv  ...
+   u31755-m174473-s1 31755   174473    Altitude (2017)                                        Action   tablet    ...
+   u22334-m71535-s2  22334   71535     Zombieland (2009)                                       Action   mobile    ...
+Done. Returned value was: 21
+```
+
+5개 태스크(`extract_window → ingest_events → spark_process → quality_check
+→ read_result`) 전부 `success`로 완료된 것을 Audit Log로 확인했다
+(Audit Log 기준 `04:03:58` 시작 ~ `04:04:47` 종료, 약 49초 소요 — "1~2분
+내" 목표 안에 들어옴).
+
+![단일 실행 Grid 뷰](load_test_screenshots/single_run_grid.png)
+![read_result 로그](load_test_screenshots/single_run_read_result.png)
+
+### 11-3. 최신 구성도
+
+지금 구성을 다시 그리면 아래와 같다 (Kafka·Spark 부분은 3장 다이어그램과
+동일, Airflow와 서빙 레이어를 포함해 갱신):
+
+```
+[kafka_producer.py] → Kafka(viewing-events)
+                              │
+                ┌─────────────┴─────────────┐
+                ▼                            ▼
+   [실시간] Spark Structured Streaming   [배치] Airflow DAG
+   session_window 세션화                extract_window → ingest_events
+   dropDuplicates(event_id)             → spark_process(parquet 저장)
+        │                                → quality_check → read_result
+        ▼                                       │
+   PostgreSQL sessions 테이블                    ▼
+   (upsert, session_id=xxhash64)          parquet 파일(/tmp/ott_backfill/.../spark_output)
+        │
+        ▼
+   [FastAPI] /stats, /sessions  ← 서빙 레이어(11-1)
+```
+
+### 인터랙티브 아키텍처 다이어그램
+
+위 텍스트 다이어그램을 [Archify](https://github.com/tt-a1i/archify)로
+검증 가능한 형태로 다시 그렸다. `diagrams/ott-pipeline-architecture.html`을
+다운로드해 브라우저로 열면(더블클릭) 아래 4개 뷰를 전환하며 볼 수 있다.
+
+- **배치 경로**: CSV → Airflow → Spark 배치 → Quality Gate → PostgreSQL
+- **실시간 경로**: Producer → Kafka → Spark Streaming → PostgreSQL
+- **저장 결과 조회**: PostgreSQL → FastAPI → Client
+- **장애 대응**: Kafka/Spark/PostgreSQL ↔ `failure_experiments` 기록 흐름
+
+![OTT 파이프라인 구성도](diagrams/ott-pipeline-architecture.png)
+
+(구성도 파일(`ott_pipeline_architecture.drawio`)을 별도로 유지하는 대신,
+위 archify 산출물을 최신 구성도로 사용한다.)
